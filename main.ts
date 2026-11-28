@@ -6,7 +6,10 @@
 //   -> winner refined with per-row brute-force filter choice on larger instances
 //   -> final deflate: best of several zlib level-9 configurations, raced against
 //      a built-in optimal-parse deflate (zopfli-style DP with iterative cost
-//      refinement over 128 KiB blocks); the smaller stream wins.
+//      refinement over 256 KiB blocks; the match finder also records the
+//      nearest length>=8 and length>=24 matches per position, and each block
+//      is finished with one extra DP pass that may use those candidates);
+//      the smaller stream wins.
 // Only Node built-in modules. Output PNGs use only IHDR/PLTE/tRNS/IDAT/IEND, bit depth 8,
 // non-interlaced, one zlib stream in a single IDAT.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -516,6 +519,10 @@ function computeMatches(data, maxChain) {
   const matchDist = new Uint32Array(n);
   const nearLen = new Uint16Array(n);
   const nearDist = new Uint32Array(n);
+  const mid8Len = new Uint16Array(n);
+  const mid8Dist = new Uint32Array(n);
+  const mid24Len = new Uint16Array(n);
+  const mid24Dist = new Uint32Array(n);
   const head = new Int32Array(HASH_SIZE).fill(-1);
   const prev = new Int32Array(n);
   for (let i = 0; i < n; i++) {
@@ -527,12 +534,18 @@ function computeMatches(data, maxChain) {
       let bestDist = 0;
       let nLen = 0;
       let nDist = 0;
+      let m8Len = 0;
+      let m8Dist = 0;
+      let m24Len = 0;
+      let m24Dist = 0;
       let chain = maxChain;
       while (j >= limit && chain-- > 0) {
         if (data[j + bestLen] === data[i + bestLen] && data[j] === data[i]) {
           let l = 0;
           while (l < maxLen && data[j + l] === data[i + l]) l++;
           if (l >= 3 && nLen === 0) { nLen = l; nDist = i - j; }
+          if (l >= 8 && m8Len === 0) { m8Len = l; m8Dist = i - j; }
+          if (l >= 24 && m24Len === 0) { m24Len = l; m24Dist = i - j; }
           if (l > bestLen) {
             bestLen = l;
             bestDist = i - j;
@@ -545,6 +558,8 @@ function computeMatches(data, maxChain) {
       }
       if (bestLen >= 3) { matchLen[i] = bestLen; matchDist[i] = bestDist; }
       if (nLen >= 3) { nearLen[i] = nLen; nearDist[i] = nDist; }
+      if (m8Len >= 8) { mid8Len[i] = m8Len; mid8Dist[i] = m8Dist; }
+      if (m24Len >= 24) { mid24Len[i] = m24Len; mid24Dist[i] = m24Dist; }
     }
     if (i + 2 < n) {
       const h = hashAt(data, i);
@@ -552,13 +567,13 @@ function computeMatches(data, maxChain) {
       head[h] = i;
     }
   }
-  return { matchLen, matchDist, nearLen, nearDist };
+  return { matchLen, matchDist, nearLen, nearDist, mid8Len, mid8Dist, mid24Len, mid24Dist };
 }
 
 // Parses data[start..end); pick/pickDist are filled at absolute positions.
 // Matches may reference data before `start` (distances reach across blocks).
-function dpParse(data, start, end, M, litCost, lenCost, distCost, pick, pickDist) {
-  const { matchLen, matchDist, nearLen, nearDist } = M;
+function dpParse(data, start, end, M, litCost, lenCost, distCost, pick, pickDist, rich) {
+  const { matchLen, matchDist, nearLen, nearDist, mid8Len, mid8Dist, mid24Len, mid24Dist } = M;
   const n = end - start;
   const cost = new Float64Array(n + 1);
   for (let k = n - 1; k >= 0; k--) {
@@ -566,10 +581,14 @@ function dpParse(data, start, end, M, litCost, lenCost, distCost, pick, pickDist
     let best = litCost[data[i]] + cost[k + 1];
     let bl = 0;
     let bd = 0;
-    for (let cand = 0; cand < 2; cand++) {
-      const ml = cand === 0 ? matchLen[i] : nearLen[i];
-      const md = cand === 0 ? matchDist[i] : nearDist[i];
-      if (ml < 3 || (cand === 1 && md === matchDist[i])) continue;
+    for (let cand = 0; cand < (rich ? 4 : 2); cand++) {
+      const ml = cand === 0 ? matchLen[i] : cand === 1 ? nearLen[i] : cand === 2 ? mid8Len[i] : mid24Len[i];
+      const md = cand === 0 ? matchDist[i] : cand === 1 ? nearDist[i] : cand === 2 ? mid8Dist[i] : mid24Dist[i];
+      if (ml < 3 || (cand > 0 && md === matchDist[i])) continue;
+      if (cand === 2 && md === nearDist[i]) continue;
+      if (cand === 3 && (md === nearDist[i] || md === mid8Dist[i])) continue;
+      if (cand === 2 && ml <= nearLen[i] && md >= nearDist[i]) continue;
+      if (cand === 3 && ((ml <= nearLen[i] && md >= nearDist[i]) || (ml <= mid8Len[i] && md >= mid8Dist[i]))) continue;
       const dc = distCost[md];
       const cap = ml < n - k ? ml : n - k;
       for (let ci = 0; ci < CAND.length; ci++) {
@@ -709,7 +728,7 @@ function emitBlock(w, data, start, end, pick, pickDist, litLen, distLen, isFinal
   w.huff(litCode[256], litLen[256]);
 }
 
-function optimalDeflate(data, { iterations = 12, maxChain = 1024, blockSize = 131072 } = {}) {
+function optimalDeflate(data, { iterations = 12, maxChain = 4096, blockSize = 262144 } = {}) {
   const M = computeMatches(data, maxChain);
   const pick = new Uint16Array(data.length);
   const pickDist = new Uint32Array(data.length);
@@ -737,10 +756,20 @@ function optimalDeflate(data, { iterations = 12, maxChain = 1024, blockSize = 13
       litLen = huffmanLengths(stats.litCounts, 15);
       distLen = huffmanLengths(stats.distCounts, 15);
       // deterministic early stop: this block's estimated cost has converged
-      if (it >= 3 && prevBits - bits < prevBits * 0.0002) {
-        if (++flatRuns >= 2) break;
+      if (it >= 3 && prevBits - bits < prevBits * 0.0005) {
+        if (++flatRuns >= 1) break;
       } else flatRuns = 0;
       prevBits = bits;
+    }
+    // One last parse of this block with the converged cost model, now also
+    // allowed to use the nearest-longer-match candidates; then refresh the
+    // code lengths from that parse's statistics for emission.
+    {
+      const { litCost, lenCost, distCost } = costsFromLengths(litLen, distLen);
+      dpParse(data, start, end, M, litCost, lenCost, distCost, pick, pickDist, true);
+      stats = statsOf(data, start, end, pick, pickDist);
+      litLen = huffmanLengths(stats.litCounts, 15);
+      distLen = huffmanLengths(stats.distCounts, 15);
     }
     emitBlock(w, data, start, end, pick, pickDist, litLen, distLen, end === data.length);
   }
