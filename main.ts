@@ -4,12 +4,20 @@
 //   (palette by count, palette by luminance, grey / grey+alpha / RGB / RGBA / tRNS-keyed)
 //   -> filter screen (fixed 0-4, minimum-sum, fewest-pairs; zlib level 6 weighs each)
 //   -> winner refined with per-row brute-force filter choice on larger instances
-//   -> final deflate: best of several zlib level-9 configurations.
+//   -> final deflate: best of several zlib level-9 configurations, raced against
+//      a built-in optimal-parse deflate (zopfli-style DP with iterative cost
+//      refinement over 128 KiB blocks); the smaller stream wins.
 // Only Node built-in modules. Output PNGs use only IHDR/PLTE/tRNS/IDAT/IEND, bit depth 8,
 // non-interlaced, one zlib stream in a single IDAT.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { constants, deflateSync, inflateSync } from 'node:zlib';
+import { setFlagsFromString } from 'node:v8';
+
+// The sandbox gives this process 512 MiB; cap the heap well under it so the
+// collector recycles the compressor's transient buffers instead of letting
+// the resident set drift toward the limit.
+setFlagsFromString('--max-old-space-size=384');
 
 // ---------------------------------------------------------------- PNG basics
 const SIGNATURE = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
@@ -387,6 +395,378 @@ function bestDeflate(data, optsList) {
   return best;
 }
 
+// ------------------------------------------------------- optimal-parse deflate
+// A zopfli-style compressor: hash-chain match finding (longest match plus the
+// nearest match of length >= 3 as a second distance candidate), then per
+// 128 KiB block a dynamic-programming optimal parse whose literal/length and
+// distance costs are refined iteratively from the previous parse's Huffman
+// statistics (with a deterministic convergence stop). Emits standard dynamic
+// Huffman blocks; returns a complete zlib stream. Deterministic throughout.
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+
+const LEN_SYM = new Int16Array(259); // length -> symbol 257..285
+const LEN_EB = new Uint8Array(259);
+for (let c = 0; c < 29; c++) {
+  const hi = c < 28 ? LEN_BASE[c + 1] - 1 : 258;
+  for (let l = LEN_BASE[c]; l <= hi; l++) { LEN_SYM[l] = 257 + c; LEN_EB[l] = LEN_EXTRA[c]; }
+}
+const DIST_SYM = new Uint8Array(32769);
+const DIST_EB = new Uint8Array(32769);
+for (let c = 0; c < 30; c++) {
+  const hi = c < 29 ? DIST_BASE[c + 1] - 1 : 32768;
+  for (let d = DIST_BASE[c]; d <= hi; d++) { DIST_SYM[d] = c; DIST_EB[d] = DIST_EXTRA[c]; }
+}
+// candidate lengths to evaluate in the DP for a match: all lengths up to 24,
+// then length-code segment starts/ends, then the match length itself.
+const CAND = [];
+{
+  const set = new Set();
+  for (let l = 3; l <= 24; l++) set.add(l);
+  for (let c = 0; c < 29; c++) { set.add(LEN_BASE[c]); if (LEN_BASE[c] > 3) set.add(LEN_BASE[c] - 1); }
+  CAND.push(...[...set].filter((l) => l >= 3 && l <= 258).sort((a, b) => a - b));
+}
+
+function huffmanLengths(counts, maxBits) {
+  const n = counts.length;
+  const lengths = new Int32Array(n);
+  const used = [];
+  for (let i = 0; i < n; i++) if (counts[i] > 0) used.push(i);
+  if (used.length === 0) return lengths;
+  if (used.length === 1) { lengths[used[0]] = 1; return lengths; }
+  // unconstrained Huffman via repeated two-smallest merge (alphabet <= 286)
+  const weight = new Float64Array(2 * used.length);
+  const parent = new Int32Array(2 * used.length).fill(-1);
+  for (let i = 0; i < used.length; i++) weight[i] = counts[used[i]];
+  let nodes = used.length;
+  const alive = new Set(Array.from({ length: nodes }, (_, i) => i));
+  while (alive.size > 1) {
+    let a = -1, b = -1;
+    for (const i of alive) {
+      if (a === -1 || weight[i] < weight[a]) { b = a; a = i; }
+      else if (b === -1 || weight[i] < weight[b]) b = i;
+    }
+    alive.delete(a); alive.delete(b);
+    weight[nodes] = weight[a] + weight[b];
+    parent[a] = nodes; parent[b] = nodes;
+    alive.add(nodes);
+    nodes++;
+  }
+  for (let i = 0; i < used.length; i++) {
+    let d = 0, j = i;
+    while (parent[j] !== -1) { d++; j = parent[j]; }
+    lengths[used[i]] = d;
+  }
+  let maxLen = 0;
+  for (const i of used) if (lengths[i] > maxLen) maxLen = lengths[i];
+  if (maxLen <= maxBits) return lengths;
+  // Overflow fix on the length histogram (the method zlib's gen_bitlen uses):
+  // clamp deep codes to maxBits, then repeatedly split the deepest available
+  // shorter code and drop one maxBits code; each step keeps the symbol count
+  // and lowers the Kraft sum (units of 2^-maxBits) by exactly 1.
+  const blCount = new Int32Array(maxLen + 2);
+  for (const i of used) blCount[lengths[i]]++;
+  let kraft = 0;
+  for (let l = 1; l < maxBits; l++) kraft += blCount[l] * (1 << (maxBits - l));
+  let deep = 0;
+  for (let l = maxBits; l <= maxLen; l++) deep += blCount[l];
+  kraft += deep; // clamped codes contribute 1 unit each
+  blCount[maxBits] = deep;
+  const target = 1 << maxBits;
+  while (kraft > target) {
+    let m = maxBits - 1;
+    while (blCount[m] === 0) m--;
+    blCount[m]--;
+    blCount[m + 1] += 2;
+    blCount[maxBits]--;
+    kraft--;
+  }
+  // hand the lengths back out: shortest lengths to the largest counts
+  const byCountDesc = [...used].sort((x, y) => counts[y] - counts[x] || x - y);
+  const out = new Int32Array(n);
+  let at = 0;
+  for (let l = 1; l <= maxBits; l++) for (let k = 0; k < blCount[l]; k++) out[byCountDesc[at++]] = l;
+  return out;
+}
+
+function canonicalCodes(lengths) {
+  const maxBits = Math.max(...lengths);
+  const blCount = new Int32Array(maxBits + 1);
+  for (const l of lengths) if (l > 0) blCount[l]++;
+  const next = new Int32Array(maxBits + 1);
+  let code = 0;
+  for (let b = 1; b <= maxBits; b++) { code = (code + blCount[b - 1]) << 1; next[b] = code; }
+  const codes = new Int32Array(lengths.length);
+  for (let i = 0; i < lengths.length; i++) if (lengths[i] > 0) codes[i] = next[lengths[i]]++;
+  return codes;
+}
+
+const HASH_BITS = 16;
+const HASH_SIZE = 1 << HASH_BITS;
+function hashAt(data, i) {
+  const v = (data[i] << 16) ^ (data[i + 1] << 8) ^ data[i + 2];
+  return (Math.imul(v, 0x9e3779b1) >>> (32 - HASH_BITS)) & (HASH_SIZE - 1);
+}
+
+function computeMatches(data, maxChain) {
+  const n = data.length;
+  const matchLen = new Uint16Array(n);
+  const matchDist = new Uint32Array(n);
+  const nearLen = new Uint16Array(n);
+  const nearDist = new Uint32Array(n);
+  const head = new Int32Array(HASH_SIZE).fill(-1);
+  const prev = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    const maxLen = Math.min(258, n - i);
+    if (maxLen >= 3) {
+      const limit = i - 32768 > 0 ? i - 32768 : 0;
+      let j = head[hashAt(data, i)];
+      let bestLen = 2;
+      let bestDist = 0;
+      let nLen = 0;
+      let nDist = 0;
+      let chain = maxChain;
+      while (j >= limit && chain-- > 0) {
+        if (data[j + bestLen] === data[i + bestLen] && data[j] === data[i]) {
+          let l = 0;
+          while (l < maxLen && data[j + l] === data[i + l]) l++;
+          if (l >= 3 && nLen === 0) { nLen = l; nDist = i - j; }
+          if (l > bestLen) {
+            bestLen = l;
+            bestDist = i - j;
+            if (l >= maxLen) break;
+            if (l >= 64) chain = Math.min(chain, 4);
+            else if (l >= 16) chain = Math.min(chain, 16);
+          }
+        }
+        j = prev[j];
+      }
+      if (bestLen >= 3) { matchLen[i] = bestLen; matchDist[i] = bestDist; }
+      if (nLen >= 3) { nearLen[i] = nLen; nearDist[i] = nDist; }
+    }
+    if (i + 2 < n) {
+      const h = hashAt(data, i);
+      prev[i] = head[h];
+      head[h] = i;
+    }
+  }
+  return { matchLen, matchDist, nearLen, nearDist };
+}
+
+// Parses data[start..end); pick/pickDist are filled at absolute positions.
+// Matches may reference data before `start` (distances reach across blocks).
+function dpParse(data, start, end, M, litCost, lenCost, distCost, pick, pickDist) {
+  const { matchLen, matchDist, nearLen, nearDist } = M;
+  const n = end - start;
+  const cost = new Float64Array(n + 1);
+  for (let k = n - 1; k >= 0; k--) {
+    const i = start + k;
+    let best = litCost[data[i]] + cost[k + 1];
+    let bl = 0;
+    let bd = 0;
+    for (let cand = 0; cand < 2; cand++) {
+      const ml = cand === 0 ? matchLen[i] : nearLen[i];
+      const md = cand === 0 ? matchDist[i] : nearDist[i];
+      if (ml < 3 || (cand === 1 && md === matchDist[i])) continue;
+      const dc = distCost[md];
+      const cap = ml < n - k ? ml : n - k;
+      for (let ci = 0; ci < CAND.length; ci++) {
+        const l = CAND[ci];
+        if (l > cap) break;
+        const c = lenCost[l] + dc + cost[k + l];
+        if (c < best) { best = c; bl = l; bd = md; }
+      }
+      if (cap > 24) {
+        const c = lenCost[cap] + dc + cost[k + cap];
+        if (c < best) { best = c; bl = cap; bd = md; }
+      }
+    }
+    cost[k] = best;
+    pick[i] = bl;
+    pickDist[i] = bd;
+  }
+  return cost[0];
+}
+
+function statsOf(data, start, end, pick, pickDist) {
+  const litCounts = new Float64Array(288);
+  const distCounts = new Float64Array(30);
+  let i = start;
+  while (i < end) {
+    const l = pick[i];
+    if (l === 0) { litCounts[data[i]]++; i++; }
+    else {
+      litCounts[LEN_SYM[l]]++;
+      distCounts[DIST_SYM[pickDist[i]]]++;
+      i += l;
+    }
+  }
+  litCounts[256] = 1;
+  return { litCounts, distCounts };
+}
+
+function costsFromLengths(litLen, distLen) {
+  const litCost = new Float64Array(288);
+  for (let i = 0; i < 288; i++) litCost[i] = litLen[i] === 0 ? 15 : litLen[i];
+  const lenCost = new Float64Array(259);
+  for (let l = 3; l <= 258; l++) lenCost[l] = (litLen[LEN_SYM[l]] === 0 ? 15 : litLen[LEN_SYM[l]]) + LEN_EB[l];
+  const distCost = new Float64Array(32769);
+  for (let d = 1; d <= 32768; d++) distCost[d] = (distLen[DIST_SYM[d]] === 0 ? 15 : distLen[DIST_SYM[d]]) + DIST_EB[d];
+  return { litCost: litCost.subarray(0, 256), lenCost, distCost };
+}
+
+function revBits(code, len) {
+  let r = 0;
+  for (let i = 0; i < len; i++) { r = (r << 1) | (code & 1); code >>= 1; }
+  return r;
+}
+
+class BitWriter {
+  constructor() { this.bytes = []; this.buf = 0; this.cnt = 0; }
+  bits(value, count) {
+    this.buf |= value << this.cnt;
+    this.cnt += count;
+    while (this.cnt >= 8) { this.bytes.push(this.buf & 0xff); this.buf >>>= 8; this.cnt -= 8; }
+  }
+  // Huffman codes are read by the decoder MSB-first: emit the code
+  // bit-reversed through the LSB-first writer.
+  huff(code, count) { this.bits(revBits(code, count), count); }
+  finish() {
+    if (this.cnt > 0) this.bytes.push(this.buf & 0xff);
+    return Uint8Array.from(this.bytes);
+  }
+}
+
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+function emitBlock(w, data, start, end, pick, pickDist, litLen, distLen, isFinal) {
+  const litCode = canonicalCodes(litLen);
+  const distCode = canonicalCodes(distLen);
+  let hlit = 286;
+  while (hlit > 257 && litLen[hlit - 1] === 0) hlit--;
+  let hdist = 30;
+  while (hdist > 1 && distLen[hdist - 1] === 0) hdist--;
+  const allLens = [];
+  for (let i = 0; i < hlit; i++) allLens.push(litLen[i]);
+  for (let i = 0; i < hdist; i++) allLens.push(distLen[i]);
+  // run-length encode the code lengths
+  const rle = []; // [symbol, extraValue, extraBits]
+  let p = 0;
+  while (p < allLens.length) {
+    const v = allLens[p];
+    let run = 1;
+    while (p + run < allLens.length && allLens[p + run] === v) run++;
+    if (v === 0) {
+      let left = run;
+      while (left >= 11) { const t = Math.min(left, 138); rle.push([18, t - 11, 7]); left -= t; }
+      if (left >= 3) { rle.push([17, left - 3, 3]); left = 0; }
+      while (left-- > 0) rle.push([0, 0, 0]);
+    } else {
+      rle.push([v, 0, 0]);
+      let left = run - 1;
+      while (left >= 3) { const t = Math.min(left, 6); rle.push([16, t - 3, 2]); left -= t; }
+      while (left-- > 0) rle.push([v, 0, 0]);
+    }
+    p += run;
+  }
+  const clCounts = new Float64Array(19);
+  for (const [s] of rle) clCounts[s]++;
+  const clLenFull = huffmanLengths(clCounts, 7);
+  let hclen = 19;
+  while (hclen > 4 && clLenFull[CL_ORDER[hclen - 1]] === 0) hclen--;
+  const clCodesBySym = canonicalCodes(clLenFull);
+  // header
+  w.bits(isFinal ? 1 : 0, 1);
+  w.bits(2, 2); // dynamic Huffman block
+  w.bits(hlit - 257, 5);
+  w.bits(hdist - 1, 5);
+  w.bits(hclen - 4, 4);
+  for (let i = 0; i < hclen; i++) w.bits(clLenFull[CL_ORDER[i]], 3);
+  for (const [s, ev, eb] of rle) {
+    w.huff(clCodesBySym[s], clLenFull[s]);
+    if (eb > 0) w.bits(ev, eb);
+  }
+  // data
+  let i = start;
+  while (i < end) {
+    const l = pick[i];
+    if (l === 0) {
+      w.huff(litCode[data[i]], litLen[data[i]]);
+      i++;
+    } else {
+      const sym = LEN_SYM[l];
+      w.huff(litCode[sym], litLen[sym]);
+      if (LEN_EB[l] > 0) w.bits(l - LEN_BASE[sym - 257], LEN_EB[l]);
+      const d = pickDist[i];
+      const dsym = DIST_SYM[d];
+      w.huff(distCode[dsym], distLen[dsym]);
+      if (DIST_EB[d] > 0) w.bits(d - DIST_BASE[dsym], DIST_EB[d]);
+      i += l;
+    }
+  }
+  w.huff(litCode[256], litLen[256]);
+}
+
+function optimalDeflate(data, { iterations = 12, maxChain = 1024, blockSize = 131072 } = {}) {
+  const M = computeMatches(data, maxChain);
+  const pick = new Uint16Array(data.length);
+  const pickDist = new Uint32Array(data.length);
+  const w = new BitWriter();
+  for (let start = 0; start < data.length; start += blockSize) {
+    const end = Math.min(data.length, start + blockSize);
+    // seed statistics with a greedy longest-match parse of this block
+    {
+      let i = start;
+      while (i < end) {
+        const cap = Math.min(M.matchLen[i], end - i);
+        if (cap >= 3) { pick[i] = cap; pickDist[i] = M.matchDist[i]; i += cap; }
+        else { pick[i] = 0; i++; }
+      }
+    }
+    let stats = statsOf(data, start, end, pick, pickDist);
+    let litLen = huffmanLengths(stats.litCounts, 15);
+    let distLen = huffmanLengths(stats.distCounts, 15);
+    let prevBits = Infinity;
+    let flatRuns = 0;
+    for (let it = 0; it < iterations; it++) {
+      const { litCost, lenCost, distCost } = costsFromLengths(litLen, distLen);
+      const bits = dpParse(data, start, end, M, litCost, lenCost, distCost, pick, pickDist);
+      stats = statsOf(data, start, end, pick, pickDist);
+      litLen = huffmanLengths(stats.litCounts, 15);
+      distLen = huffmanLengths(stats.distCounts, 15);
+      // deterministic early stop: this block's estimated cost has converged
+      if (it >= 3 && prevBits - bits < prevBits * 0.0002) {
+        if (++flatRuns >= 2) break;
+      } else flatRuns = 0;
+      prevBits = bits;
+    }
+    emitBlock(w, data, start, end, pick, pickDist, litLen, distLen, end === data.length);
+  }
+  return w.finish();
+}
+
+function zlibWrap(deflateBytes, data) {
+  // zlib header 0x78 0xDA + adler32 of the uncompressed data
+  let a = 1, b = 0;
+  for (let i = 0; i < data.length; i++) {
+    a = (a + data[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  const adler = ((b << 16) | a) >>> 0;
+  const out = new Uint8Array(deflateBytes.length + 6);
+  out[0] = 0x78;
+  out[1] = 0xda;
+  out.set(deflateBytes, 2);
+  const n = deflateBytes.length + 2;
+  out[n] = (adler >>> 24) & 0xff;
+  out[n + 1] = (adler >>> 16) & 0xff;
+  out[n + 2] = (adler >>> 8) & 0xff;
+  out[n + 3] = adler & 0xff;
+  return out;
+}
+
 const chunkBytes = (form) => (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
 
 function pngOfForm(width, height, form, idat) {
@@ -404,7 +784,7 @@ function squeeze(rgba, width, height) {
   // Screen: cheap filter choices weighed by zlib level 6 (no brute yet).
   let best = null; // {form, data, bytes} bytes counts zlib stream + PLTE/tRNS chunks
   for (const form of forms) {
-    const choices = form.palette ? [0, 'minsum'] : [0, 1, 2, 4, 'minsum', 'pairs'];
+    const choices = form.palette ? [0, 'minsum'] : [0, 2, 'minsum', 'pairs'];
     const chunks = chunkBytes(form);
     for (const choice of choices) {
       const data = filtered(form.samples, width, height, form.bpp, choice);
@@ -421,8 +801,22 @@ function squeeze(rgba, width, height) {
     const bytes = z.length + chunkBytes(best.form);
     if (bytes < best.bytes) best = { form: best.form, data, bytes };
   }
-  // Final: strongest zlib configurations on the winning filtered data.
-  const idat = bestDeflate(best.data, FINAL_OPTS);
+  // Final: strongest zlib configurations on the winning filtered data, raced
+  // against the optimal-parse compressor. When the parser beats the first
+  // zlib configuration by more than 1% the remaining configurations (which
+  // never differed from it by more than a fraction of a percent in testing)
+  // are skipped; otherwise all of them run and the true minimum is kept.
+  let idat = bestDeflate(best.data, [FINAL_OPTS[0]]);
+  const parsed = best.data.length >= 16
+    ? zlibWrap(optimalDeflate(best.data), best.data)
+    : null;
+  if (parsed !== null && parsed.length < idat.length * 0.99) {
+    idat = parsed;
+  } else {
+    const rest = bestDeflate(best.data, FINAL_OPTS.slice(1));
+    if (rest.length < idat.length) idat = rest;
+    if (parsed !== null && parsed.length < idat.length) idat = parsed;
+  }
   return pngOfForm(width, height, best.form, new Uint8Array(idat.buffer, idat.byteOffset, idat.length));
 }
 

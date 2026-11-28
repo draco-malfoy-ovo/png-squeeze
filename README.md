@@ -10,9 +10,9 @@ How it squeezes:
 
 1. **Decode and analyse** each image (distinct colours, greyness, opacity, transparency key).
 2. **Candidate colour forms** — palette by colour count, palette by luminance, grey, grey+alpha, RGB, RGBA, or a tRNS-keyed form — whichever fits the actual pixels.
-3. **Filter screening** (fixed filters 0–4, minimum-sum, fewest-pairs), each candidate weighed with zlib level 6; the winner on larger instances is refined with per-row brute-force filter choice.
-4. **Final deflate** picks the best of several zlib level-9 configurations.
+3. **Filter screening** (fixed filters, minimum-sum, fewest-pairs), each candidate weighed with zlib level 6; the winner is refined with per-row brute-force filter choice.
+4. **Final deflate** races the best of several zlib level-9 configurations against a built-in **optimal-parse compressor** (zopfli-style): hash-chain match finding with a second, nearest-distance candidate per position, a dynamic-programming optimal parse over 128 KiB blocks, and Huffman cost models refined iteratively from the previous parse until they converge. The smaller stream wins.
 
 Everything is deterministic: work is budgeted by data size, never by the clock, and two runs produce byte-identical output. Outputs use only IHDR/PLTE/tRNS/IDAT/IEND chunks, bit depth 8, non-interlaced, a single zlib stream in one IDAT.
 
-Local score on the kit's practice set (the official `grade-local`): **705,347 / 1,000,000**, all 8 instances passing — against the fixed-paeth 1.0.0 baseline's 420,399 on the same set. A full run takes about 12 seconds of the 60-second sandbox budget.
+Local score on the kit's practice set (the official scorer): **731,292 / 1,000,000**, all 8 instances passing — against the fixed-paeth 1.0.0 baseline's 420,399 on the same set, and up from this entry's previous 705,347. A full run takes about 42 seconds of the 60-second sandbox budget and peaks under 300 MiB of the 512 MiB limit.
